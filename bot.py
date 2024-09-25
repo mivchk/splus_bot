@@ -1,11 +1,11 @@
 import logging
 import asyncio
 import asyncpg
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -28,6 +28,9 @@ class Registration(StatesGroup):
     mentor = State()
     contacts = State()
 
+class Contacts(StatesGroup):
+    type_of_activity = State()
+
 
 async def get(query: str, args: list = [], one_row: bool = False):
     global pool
@@ -37,7 +40,7 @@ async def get(query: str, args: list = [], one_row: bool = False):
         else:
             return await conn.fetchrow(query, *args)
 
-async def put(query: str, args: list = None):
+async def put(query: str, args: list = []):
     global pool
     async with pool.acquire() as conn:
         return await conn.execute(query, *args)
@@ -58,7 +61,7 @@ async def command_start(message: Message, state: FSMContext):
 async def process_name(message: Message, state: FSMContext):
     await state.set_state(Registration.city)
     await state.update_data(name=message.text)
-    cities = await get('select * from cities')
+    cities = await get('select city_id, city_name from cities')
     await message.answer(
         f'Привет, {message.text}!\nВыбери свой город!',
         reply_markup=InlineKeyboardMarkup(
@@ -72,7 +75,7 @@ async def process_name(message: Message, state: FSMContext):
 async def process_city(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Registration.activity)
     await state.update_data(city=callback.data)
-    activities = await get('select * from type_of_activity')
+    activities = await get('select activity_id, activity_name from type_of_activity')
     await callback.message.edit_text(
         f'Чем ты занимаешься?',
         reply_markup=InlineKeyboardMarkup(
@@ -112,6 +115,7 @@ async def process_meet(callback: CallbackQuery, state: FSMContext):
 async def finish_registration(callback: CallbackQuery, state: FSMContext):
     await state.update_data(contacts=callback.data)
     data = await state.get_data()
+    await state.clear()
     await callback.message.delete()
     await callback.message.answer('Поздравляем, вы зарегестрированы!\nВаш уровень: 1')
     await put(
@@ -121,6 +125,73 @@ async def finish_registration(callback: CallbackQuery, state: FSMContext):
         """,
         [data['name'], int(data['city']), int(data['activity']), bool(data['meet']), bool(data['contacts']), callback.from_user.username]
     )
+
+@dp.message(Command('cancel'))
+async def cancel_command(message: Message, state: FSMContext):
+    await message.answer('Вы отменили текущее действие!')
+    await state.clear()
+
+@dp.message(Command('meetings'))
+async def change_status(message: Message):
+    tg_username = message.from_user.username
+    current_status = await get('select in_meetings from users where tg_username = $1', [tg_username], True)
+    if not current_status:
+        await message.answer('Похоже ты не зарегистрирован, нажми /start для регистрации')
+    elif current_status['in_meetings'] == True:
+        await put('update users set in_meetings = false where tg_username = $1', [tg_username])
+        await message.answer('Статус изменен, теперь вы не получаете приглашения на мероприятия(')
+    elif current_status['in_meetings'] == False:
+        await put('update users set in_meetings = true where tg_username = $1', [tg_username])
+        await message.answer('Ждем вас на будущих встречах!')
+    
+
+@dp.message(Command('contacts'))
+async def change_contacts_status(message: Message):
+    tg_username = message.from_user.username
+    current_status = await get('select in_contacts from users where tg_username = $1', [tg_username], True)
+    if not current_status:
+        await message.answer('Похоже ты не зарегистрирован, нажми /start для регистрации')
+    elif current_status['in_contacts'] == True:
+        await put('update users set in_contacts = false where tg_username = $1', [tg_username])
+        await message.answer('Ваш контакт больше не отображается для других пользователей')
+    elif current_status['in_contacts'] == False:
+        await put('update users set in_contacts = true where tg_username = $1', [tg_username])
+        await message.answer('Ваш контакт теперь доступен в обмене контактами с другими пользователями!')
+
+@dp.message(F.text == 'Хочу общаться!')
+async def get_contact(message: Message, state: FSMContext):
+    await state.set_state(Contacts.type_of_activity)
+    check = await get('select in_contacts from users where tg_username = $1', [message.from_user.username], True)
+    if check and check['in_contacts'] == True:
+        activities = await get('select activity_id, activity_name from type_of_activity')
+        await message.answer(
+            'Отлично, давай подберем тебе подходящего собеседника!\nКого ты ищешь?',
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=activity['activity_name'], callback_data=str(activity['activity_id']))] for activity in activities
+                ]
+            )
+        )
+    elif not check:
+        await message.answer('Похоже мы не знакомы, чтобы общаться с крутыми ребятами и быть в курсе событий ты должен зарегистрироваться! Для этого напиши /start')
+    elif not check['in_contacts']:
+        await message.answer('К сожалению, ты не участвуешь в программе контактов, чтобы это изменить напиши /contacts')
+
+@dp.callback_query(Contacts.type_of_activity)
+async def process_get_contact(callback: CallbackQuery, state: FSMContext):
+    user_city = await get('select city_id from users where tg_username = $1', [callback.from_user.username], True)
+    contact = await get('select user_name, level, tg_username from users where activity_id = $1 and city_id = $2 and in_contacts is true order by random() limit 1', [int(callback.data), int(user_city['city_id'])], True)
+    if contact:
+        await callback.message.edit_text(
+            f"Отлично, подобрал контакт по твоим запросам!\n{contact['user_name']}, {contact['level']} уровень: @{contact['tg_username']}"
+        )
+    else:
+        await callback.message.edit_text('К сожалению по твоему запросу ничего не нашлось, попробуй позже(')
+    await state.clear()
+
+@dp.message(F.text)
+async def welcome_func(message: Message):
+    await message.answer(f'Привет! Меня зовут Сэлвестр, можно просто сэл, я коммьюнити менеджер, помогаю селлерам развивать свой нетворкинг.\nЧтобы найти собеседника напиши: "Хочу общаться!"')
 
 async def main():
     global pool
