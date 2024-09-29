@@ -8,7 +8,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 from config import BOT_TOKEN, PG_LINK
 
@@ -31,6 +33,15 @@ class Registration(StatesGroup):
 class Contacts(StatesGroup):
     type_of_activity = State()
 
+kb = [
+        [
+            KeyboardButton(text='Хочу общаться! ')
+        ]
+    ]
+keyboard = ReplyKeyboardMarkup(
+    keyboard=kb,
+    resize_keyboard=True
+)   
 
 async def get(query: str, args: list = [], one_row: bool = False):
     global pool
@@ -48,8 +59,8 @@ async def put(query: str, args: list = []):
 
 @dp.message(CommandStart())
 async def command_start(message: Message, state: FSMContext):
-    if await get('select 1 from users where tg_username = $1', [message.from_user.username], True):
-        await message.answer('Вы уже зарегестрированы!')
+    if await get('select 1 from users where user_id = $1', [message.from_user.id], True):
+        await message.answer('Вы уже зарегистрированы!')
     else:
         await state.set_state(Registration.name)
         await message.answer(
@@ -100,8 +111,21 @@ async def process_activity(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(Registration.meet)
 async def process_meet(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Registration.contacts)
+    await state.set_state(Registration.mentor)
     await state.update_data(meet=callback.data)
+    await callback.message.edit_text(
+        f'Хочешь быть куратором в будущем? Мы проводим тестирование для желающих.',
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text='Да', callback_data='true'), InlineKeyboardButton(text='Нет', callback_data='false')]
+            ]
+        )
+    )
+
+@dp.callback_query(Registration.mentor)
+async def process_mentor(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Registration.contacts)
+    await state.update_data(mentor=callback.data)
     await callback.message.edit_text(
         f'Готов ли ты участвовать в программе "контакты", где ты можешь обменяться контактами с любым участником коммьюнити?',
         reply_markup=InlineKeyboardMarkup(
@@ -117,14 +141,25 @@ async def finish_registration(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     await callback.message.delete()
-    await callback.message.answer('Поздравляем, вы зарегестрированы!\nВаш уровень: 1')
-    await put(
-        """
-            insert into users(user_name, city_id, activity_id, in_meetings, in_contacts, tg_username)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """,
-        [data['name'], int(data['city']), int(data['activity']), bool(data['meet']), bool(data['contacts']), callback.from_user.username]
-    )
+    tg_username = callback.from_user.username
+    if tg_username:
+        await callback.message.answer('Поздравляем, вы зарегистрированы!', reply_markup=keyboard)
+        await put(
+            """
+                insert into users(user_id, user_name, city_id, activity_id, in_meetings, in_contacts, tg_username, wants_curator)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+            [callback.from_user.id, data['name'], int(data['city']), int(data['activity']), True if data['meet'] == 'true' else False, True if data['contacts'] == 'true' else False, tg_username, True if data['mentor'] == 'true' else False]
+        )
+    elif not tg_username:
+        await callback.message.answer('К сожалению, у вас не задан username в телеграме, вы зарегестрированы, но не участвуете в программе обмена контактами')
+        await put(
+            """
+                insert into users(user_id, user_name, city_id, activity_id, in_meetings, in_contacts, wants_curator)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            [callback.from_user.id, data['name'], int(data['city']), int(data['activity']), True if data['meet'] == 'true' else False, False, True if data['mentor'] == 'true' else False]
+        )
 
 @dp.message(Command('cancel'))
 async def cancel_command(message: Message, state: FSMContext):
@@ -147,21 +182,23 @@ async def change_status(message: Message):
 
 @dp.message(Command('contacts'))
 async def change_contacts_status(message: Message):
-    tg_username = message.from_user.username
-    current_status = await get('select in_contacts from users where tg_username = $1', [tg_username], True)
+    tg_id = message.from_user.id
+    current_status = await get('select in_contacts from users where user_id = $1', [tg_id], True)
     if not current_status:
-        await message.answer('Похоже ты не зарегистрирован, нажми /start для регистрации')
+        await message.answer('Похоже вы не зарегистрированы, нажми /start для регистрации')
+    elif not message.from_user.username:
+        await message.answer('У вас нет tg username, вы не можете участвовать в программе обмена контактами')
     elif current_status['in_contacts'] == True:
-        await put('update users set in_contacts = false where tg_username = $1', [tg_username])
+        await put('update users set in_contacts = false where user_id = $1', [tg_id])
         await message.answer('Ваш контакт больше не отображается для других пользователей')
     elif current_status['in_contacts'] == False:
-        await put('update users set in_contacts = true where tg_username = $1', [tg_username])
+        await put('update users set in_contacts = true where user_id = $1', [tg_id])
         await message.answer('Ваш контакт теперь доступен в обмене контактами с другими пользователями!')
 
-@dp.message(F.text == 'Хочу общаться!')
+@dp.message(F.text == 'Хочу общаться!' or F.text == 'Хочу общаться')
 async def get_contact(message: Message, state: FSMContext):
     await state.set_state(Contacts.type_of_activity)
-    check = await get('select in_contacts from users where tg_username = $1', [message.from_user.username], True)
+    check = await get('select in_contacts from users where user_id = $1', [message.from_user.id], True)
     if check and check['in_contacts'] == True:
         activities = await get('select activity_id, activity_name from type_of_activity')
         await message.answer(
@@ -179,8 +216,8 @@ async def get_contact(message: Message, state: FSMContext):
 
 @dp.callback_query(Contacts.type_of_activity)
 async def process_get_contact(callback: CallbackQuery, state: FSMContext):
-    user_city = await get('select city_id from users where tg_username = $1', [callback.from_user.username], True)
-    contact = await get('select user_name, level, tg_username from users where activity_id = $1 and city_id = $2 and in_contacts is true order by random() limit 1', [int(callback.data), int(user_city['city_id'])], True)
+    user_city = await get('select city_id from users where user_id = $1', [callback.from_user.id], True)
+    contact = await get('select user_name, level, tg_username from users where activity_id = $1 and city_id = $2 and in_contacts is true and tg_username is not null order by random() limit 1', [int(callback.data), int(user_city['city_id'])], True)
     if contact:
         await callback.message.edit_text(
             f"Отлично, подобрал контакт по твоим запросам!\n{contact['user_name']}, {contact['level']} уровень: @{contact['tg_username']}"
@@ -189,9 +226,17 @@ async def process_get_contact(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text('К сожалению по твоему запросу ничего не нашлось, попробуй позже(')
     await state.clear()
 
+@dp.message(Command('delete'))
+async def delete_profile(message: Message):
+    await put('delete from users where user_id = $1', [message.from_user.id])
+    await message.answer('Ваш профиль успешно удален!')
+
 @dp.message(F.text)
 async def welcome_func(message: Message):
-    await message.answer(f'Привет! Меня зовут Сэлвестр, можно просто сэл, я коммьюнити менеджер, помогаю селлерам развивать свой нетворкинг.\nЧтобы найти собеседника напиши: "Хочу общаться!"')
+    await message.answer(
+        f'Привет! Меня зовут Сэлвестр, можно просто сэл, я коммьюнити менеджер, помогаю селлерам развивать свой нетворкинг.\nЧтобы найти собеседника напиши: "Хочу общаться!"',
+        reply_markup=keyboard
+    )
 
 async def main():
     global pool
